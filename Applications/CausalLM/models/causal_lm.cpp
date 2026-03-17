@@ -23,10 +23,12 @@
 #include <algorithm>
 #include <app_context.h>
 #include <cmath>
+#include <cstdlib>
 #include <engine.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <vector>
 
 #include <common.h>
@@ -372,8 +374,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   _input.clear();
 
   unsigned int init_len = init_input.size();
-  float *input_sample =
-    (float *)malloc(sizeof(float) * BATCH_SIZE * MAX_SEQ_LEN);
+  auto input_sample = std::unique_ptr<float, decltype(&free)>(
+    static_cast<float *>(malloc(sizeof(float) * BATCH_SIZE * MAX_SEQ_LEN)),
+    free);
+  NNTR_THROW_IF(input_sample == nullptr, std::bad_alloc)
+    << "failed to allocate input sample buffer";
   std::vector<bool> eos_list(BATCH_SIZE, false);
 
   unsigned int input_len = init_len;
@@ -381,7 +386,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
     for (unsigned int i = 0; i < input_len; ++i) {
-      input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + i] =
+      input_sample.get()[static_cast<size_t>(b) * MAX_SEQ_LEN + i] =
         static_cast<float>(init_input[i]);
       ids_history[static_cast<size_t>(b) * MAX_SEQ_LEN + i] = init_input[i];
     }
@@ -391,7 +396,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    * PREFILL
    */
   std::vector<int64_t> token_ids;
-  input.push_back(input_sample);
+  input.push_back(input_sample.get());
 
   ///@note contains possible bug
   // std::vector<ml::train::TensorDim> input_dims;
@@ -460,7 +465,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   // Update generated token by prefill as an input
   for (unsigned int b = 0; b < BATCH_SIZE; ++b)
-    input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+    input_sample.get()[static_cast<size_t>(b) * MAX_SEQ_LEN] =
       static_cast<float>(id_list[b]);
 
   auto start_generation = std::chrono::high_resolution_clock::now();
@@ -476,13 +481,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
     if (token_generation_idx < input_len) {
       for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
-        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+        input_sample.get()[static_cast<size_t>(b) * MAX_SEQ_LEN] =
           static_cast<float>(init_input[token_generation_idx - SYS_PROMP_LEN]);
       }
       registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list);
     } else {
       for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
-        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+        input_sample.get()[static_cast<size_t>(b) * MAX_SEQ_LEN] =
           static_cast<float>(ids_list[b]);
       }
       registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list);
@@ -506,7 +511,6 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     }
 
     if (is_finish) {
-      free(input_sample);
       break;
     }
   }
