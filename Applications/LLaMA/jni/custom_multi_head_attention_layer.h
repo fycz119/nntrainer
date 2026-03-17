@@ -140,8 +140,8 @@ private:
 
   inline static unsigned int layer_progress;
 
-  inline static std::vector<std::vector<float>> *freqs_cos = {};
-  inline static std::vector<std::vector<float>> *freqs_sin = {};
+  inline static std::vector<std::vector<float>> freqs_cos = {};
+  inline static std::vector<std::vector<float>> freqs_sin = {};
   inline static std::vector<float> freqs;
 
   /**
@@ -151,36 +151,34 @@ private:
    * @param[in] theta rotary angle
    */
   void precompute_freqs(int dim, unsigned int seq_len, float theta = 10000.0) {
-    if (freqs_cos == nullptr) {
+    if (freqs_cos.empty()) {
       unsigned int half_ = dim / 2;
       for (unsigned int i = 0; i < half_; ++i) {
         freqs.push_back(1.0 /
                         (std::pow(theta, (2 * i) / static_cast<float>(dim))));
       }
 
-      auto cos = new std::vector<std::vector<float>>();
-      cos->assign(seq_len, std::vector<float>(dim, 0));
+      std::vector<std::vector<float>> cos(seq_len, std::vector<float>(dim, 0));
 
-      auto sin = new std::vector<std::vector<float>>();
-      sin->assign(seq_len, std::vector<float>(dim, 0));
+      std::vector<std::vector<float>> sin(seq_len, std::vector<float>(dim, 0));
 
       for (unsigned int i = 0; i < seq_len; ++i) {
 #ifdef USE_NEON
-        calc_trigonometric_vals_dup(half_, freqs.data(), (*cos)[i].data(),
-                                    (*sin)[i].data(), i);
+        calc_trigonometric_vals_dup(half_, freqs.data(), cos[i].data(),
+                                    sin[i].data(), i);
 #else
         for (unsigned int j = 0; j < half_; ++j) {
           float angle = i * freqs[j];
-          (*cos)[i][j] = std::cos(angle);
-          (*cos)[i][j + half_] = std::cos(angle); // repeated 2 times
+          cos[i][j] = std::cos(angle);
+          cos[i][j + half_] = std::cos(angle); // repeated 2 times
 
-          (*sin)[i][j] = std::sin(angle);
-          (*sin)[i][j + half_] = std::sin(angle); // repeated 2 times
+          sin[i][j] = std::sin(angle);
+          sin[i][j + half_] = std::sin(angle); // repeated 2 times
         }
 #endif
       }
-      freqs_cos = cos;
-      freqs_sin = sin;
+      freqs_cos = std::move(cos);
+      freqs_sin = std::move(sin);
     }
   }
 
@@ -225,8 +223,8 @@ private:
         for (unsigned int c = 0; c < in.channel(); c++) {
           for (unsigned int h = 0; h < in.height(); h++) {
             if (from < max_timestep) {
-              cos_ = &(*freqs_cos)[from + h];
-              sin_ = &(*freqs_sin)[from + h];
+              cos_ = &freqs_cos[from + h];
+              sin_ = &freqs_sin[from + h];
             }
 
             for (unsigned int w = 0; w < in.width(); w = w + dim) {
@@ -253,8 +251,8 @@ private:
         for (unsigned int c = 0; c < in.channel(); c++) {
           for (unsigned int h = 0; h < in.height(); h++) {
             if (from < max_timestep) {
-              cos_ = &(*freqs_cos)[from + h];
-              sin_ = &(*freqs_sin)[from + h];
+              cos_ = &freqs_cos[from + h];
+              sin_ = &freqs_sin[from + h];
             }
             for (unsigned int w = 0; w < in.width(); w = w + dim) {
 #ifdef USE_NEON

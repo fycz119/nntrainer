@@ -351,7 +351,7 @@ void MultiHeadAttentionLayer::finalize(InitLayerContext &context) {
    * check query width and key width
    *
    */
-  if (freqs_cos == nullptr)
+  if (freqs_cos.empty())
     precompute_freqs(projected_key_dim_prop, max_timestep);
 }
 
