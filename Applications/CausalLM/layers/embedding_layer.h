@@ -114,6 +114,15 @@ public:
    */
   WIN_EXPORT void setProperty(const std::vector<std::string> &values) override;
 
+  /**
+   * @copydoc Layer::save()
+   */
+  WIN_EXPORT void save(
+    std::ofstream &file, nntrainer::RunLayerContext &run_context, bool opt_var,
+    ml::train::ExecutionMode mode, bool trainable,
+    nntrainer::TensorDim::DataType dtype = nntrainer::TensorDim::DataType::NONE,
+    ml::train::ISA target_isa = ml::train::ISA::AUTO) const override;
+
   inline static const std::string type = "embedding_layer";
 
 private:

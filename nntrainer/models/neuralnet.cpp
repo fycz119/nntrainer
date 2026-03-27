@@ -617,11 +617,20 @@ void NeuralNetwork::backwarding(int iteration,
   }
 }
 
-void NeuralNetwork::save(const std::string &file_path,
-                         ml::train::ModelFormat format) {
+void NeuralNetwork::save(
+  const std::string &file_path, ml::train::ModelFormat format,
+  TensorDim::DataType dtype,
+  const std::map<std::string, TensorDim::DataType> &layer_dtype_map,
+  ml::train::ISA target_isa) {
   NNTR_THROW_IF(!initialized, std::runtime_error)
     << "Cannot save model if not initialized yet, path: " << file_path
     << " format: " << static_cast<unsigned>(format);
+
+  NNTR_THROW_IF(format != ml::train::ModelFormat::MODEL_FORMAT_BIN &&
+                  dtype != TensorDim::DataType::NONE,
+                std::runtime_error)
+    << "Cannot save the model with a specific data type unless the model "
+       "format is `MODEL_FORMAT_BIN`.";
 
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
@@ -631,7 +640,10 @@ void NeuralNetwork::save(const std::string &file_path,
       file_path, std::ios::out | std::ios::binary | std::ios::trunc);
 
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
-      (*iter)->save(model_file, false, exec_mode);
+      const auto &layer_node = *iter;
+      auto it = layer_dtype_map.find(layer_node->getName());
+      auto target_dtype = (it != layer_dtype_map.end()) ? it->second : dtype;
+      layer_node->save(model_file, false, exec_mode, target_dtype, target_isa);
     }
 
     if (opt && istrequal(opt->getType(), "adam")) {

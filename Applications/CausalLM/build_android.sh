@@ -79,5 +79,5 @@ ndk-build NDK_PROJECT_PATH=./ APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=.
 echo "Build completed successfully!"
 echo "Output files are in: $SCRIPT_DIR/jni/libs/arm64-v8a/"
 echo ""
-echo "Executable: nntrainer_causallm"
+echo "Executables: nntrainer_causallm, nntr_quantize"
 echo "Libraries: libnntrainer.so, libccapi-nntrainer.so, libc++_shared.so"

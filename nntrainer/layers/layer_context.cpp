@@ -579,6 +579,11 @@ bool RunLayerContext::validate(bool skip_input, bool skip_label) {
 #else
           throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif
+        } else {
+          tensor_map[val->getName()] =
+            val->getVariableRef().template getData<uint8_t>();
+          tensor_map[val->getGradientName()] =
+            val->getGradientRef().template getData<uint8_t>();
         }
       }
     };

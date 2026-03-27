@@ -359,16 +359,49 @@ void TieWordEmbedding::read(
   }
 }
 
-void TieWordEmbedding::save(
-  std::ofstream &file, nntrainer::RunLayerContext &run_context, bool opt_var,
-  ml::train::ExecutionMode mode, bool trainable,
-  nntrainer::TensorDim::DataType definedWeightDataType) const {
+void TieWordEmbedding::save(std::ofstream &file,
+                            nntrainer::RunLayerContext &run_context,
+                            bool opt_var, ml::train::ExecutionMode mode,
+                            bool trainable,
+                            nntrainer::TensorDim::DataType dtype,
+                            ml::train::ISA target_isa) const {
   // Only read when mode is embedding
   if (mode_ == mode::embedding) {
     // @note shared weights are only be saved at the first access
     for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
       if (run_context.isGradientFirstAccess(i)) {
-        run_context.getWeight(i).save(file);
+        auto &weight = run_context.getWeight(i);
+        if (dtype == nntrainer::TensorDim::DataType::NONE ||
+            weight.getDataType() == dtype)
+          weight.save(file);
+        else {
+          NNTR_THROW_IF(weight.getDataType() !=
+                          nntrainer::TensorDim::DataType::FP32,
+                        std::runtime_error)
+            << "Save with quantization only supports for FP32 weight.";
+          ///@note The codelines below can be replaced with quantizer's
+          /// quantize()
+          nntrainer::TensorDim dim = weight.getDim();
+          unsigned int K = dim.height();
+          unsigned int N = dim.width();
+
+          if (dtype == nntrainer::TensorDim::DataType::Q6_K) {
+            //////////////////////////////////////////////////////////////////
+            ///@note Please note that Embedding layer doesn't need to be
+            /// transposed!
+            //////////////////////////////////////////////////////////////////
+            nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                           {nntrainer::Tformat::NCHW, dtype});
+
+            nntrainer::quantize_q6_K(weight.getData<float>(),
+                                     quant_weight.getData<uint8_t>(), N, K,
+                                     nullptr);
+            quant_weight.save(file);
+          } else {
+            NNTR_THROW_IF(true, std::runtime_error)
+              << "This dtype is not supported in save with quantization";
+          }
+        }
       }
     }
   }

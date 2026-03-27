@@ -252,6 +252,27 @@ void Transformer::save_weight(const std::string &weight_path) {
   }
 };
 
+void Transformer::save_weight(
+  const std::string &weight_path, ml::train::TensorDim::DataType dtype,
+  const std::map<std::string, ml::train::TensorDim::DataType> &layer_dtype_map,
+  ml::train::ExecutionMode execution_mode, bool trainable,
+  ml::train::ISA target_isa) {
+
+  if (!is_initialized) {
+    throw std::runtime_error(
+      "Transformer model is not initialized. Please call "
+      "initialize() before save_weight().");
+  }
+
+  try {
+    model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN, dtype,
+                layer_dtype_map, target_isa);
+  } catch (const std::exception &e) {
+    throw std::runtime_error("Failed to save model weights with dtype: " +
+                             std::string(e.what()));
+  }
+};
+
 void Transformer::run(const WSTR prompt, bool do_sample,
                       const WSTR system_prompt, const WSTR tail_prompt) {
   if (!is_initialized) {

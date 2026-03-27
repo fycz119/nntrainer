@@ -35,6 +35,7 @@
 #endif
 
 #include <layer.h>
+#include <map>
 #include <model.h>
 #include <random>
 
@@ -93,6 +94,23 @@ public:
    * @brief Save the weight to a file
    */
   virtual void save_weight(const std::string &weight_path);
+
+  /**
+   * @brief Save the weight to a file with type conversion
+   * @param weight_path Path to save the weight file
+   * @param dtype Global target data type for all layers (NONE = keep original)
+   * @param layer_dtype_map Per-layer data type overrides (layer_name -> dtype)
+   * @param execution_mode Execution mode (default: INFERENCE)
+   * @param trainable Trainable flag (default: false)
+   * @param target_isa Target ISA for quantization (default: AUTO)
+   */
+  virtual void save_weight(
+    const std::string &weight_path, ml::train::TensorDim::DataType dtype,
+    const std::map<std::string, ml::train::TensorDim::DataType>
+      &layer_dtype_map = {},
+    ml::train::ExecutionMode execution_mode =
+      ml::train::ExecutionMode::INFERENCE,
+    bool trainable = false, ml::train::ISA target_isa = ml::train::ISA::AUTO);
 
   /**
    * @brief run the Transformer model

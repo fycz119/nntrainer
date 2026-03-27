@@ -29,6 +29,7 @@
 
 #include <base_properties.h>
 #include <common.h>
+#include <cpu_backend.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
 
@@ -349,11 +350,14 @@ public:
    * @param opt_var boolean variable whether saving optimizer variables
    * @param mode Execution mode
    * @param trainable is there trainable weight
-   * @param definedWeightDataTey current data type of the layer
+   * @param dtype data type to save this layer
+   * @param target_isa target ISA (Instruction Set Architecture) format for
+   * quantization (AUTO/X86/ARM)
    */
   virtual void save(std::ofstream &file, RunLayerContext &run_context,
                     bool opt_var, ml::train::ExecutionMode mode, bool trainable,
-                    TensorDim::DataType definedWeightDataType) const {
+                    TensorDim::DataType dtype = TensorDim::DataType::NONE,
+                    ml::train::ISA target_isa = ml::train::ISA::AUTO) const {
 
     if (opt_var) {
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
@@ -371,7 +375,47 @@ public:
       // @note shared weights are only be saved at the first access
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
         if (run_context.isGradientFirstAccess(i)) {
-          run_context.getWeight(i).save(file);
+          auto &weight = run_context.getWeight(i);
+          if (dtype == TensorDim::DataType::NONE ||
+              weight.getDataType() == dtype)
+            weight.save(file);
+          else {
+            if (dtype == TensorDim::DataType::Q4_0) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+              ///@note The codelines below can be replaced with quantizer's
+              /// quantize()
+              TensorDim dim = weight.getDim();
+              unsigned int K = dim.height();
+              unsigned int N = dim.width();
+
+              // Skip quantization for bias-like tensors (1D with height == 1)
+              // as they are not suitable for Q4_0 block quantization
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                NNTR_THROW_IF(N % 32 != 0 || K % 32 != 0, std::invalid_argument)
+                  << "Q4_0 quantization requires both width and height to be "
+                     "divisible by 32, but got height="
+                  << K << ", width=" << N;
+
+                Tensor weight_t = weight.transpose("0:2:1");
+                Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                    {Tformat::NCHW, dtype});
+                std::vector<char> tmp(quant_weight.size());
+
+                quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
+                              nullptr);
+                repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
+                            quant_weight.size(), N, K, target_isa);
+                quant_weight.save(file);
+              }
+            } else {
+              NNTR_THROW_IF(true, std::runtime_error)
+                << "This dtype is not supported in save with quantization";
+            }
+          }
         }
       }
     }

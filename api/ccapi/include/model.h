@@ -18,6 +18,7 @@
 
 #if __cplusplus >= MIN_CPP_VERSION
 
+#include <map>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -158,12 +159,29 @@ public:
 
   /**
    * @brief  save model states and training parameters from a file
-   * @param file_path file_path to save the model, if full path is not
+   * @param[in] file_path file_path to save the model, if full path is not
    * given, it should be saved inside working directory
-   * @param format format to save parameters
+   * @param[in] format format to save parameters
+   * @param[in] dtype default data type to save all weights. Only Q4_0 is
+   *            currently supported as the target type. Conversion is only
+   *            supported when the current weight type is FP32.
+   * @param[in] layer_dtype_map a map of layer name to data type. If a layer
+   * name is found in this map, its weights are saved with the specific data
+   *            type instead of @a dtype.
+   * @param[in] target_isa target ISA (Instruction Set Architecture) format for
+   * quantization (AUTO/X86/ARM). Enables cross-platform quantization, e.g.,
+   * quantizing on x86 but saving in ARM format.
+   * @note When @a dtype equals the current weight type of a layer and the layer
+   *       is not in @a layer_dtype_map , the weights are saved as-is without
+   *       any conversion.
+   * @note save-with-dtype only supports the `MODEL_FORMAT_BIN` model format
    */
-  virtual void save(const std::string &file_path,
-                    ModelFormat format = ModelFormat::MODEL_FORMAT_BIN) = 0;
+  virtual void
+  save(const std::string &file_path,
+       ModelFormat format = ModelFormat::MODEL_FORMAT_BIN,
+       TensorDim::DataType dtype = TensorDim::DataType::NONE,
+       const std::map<std::string, TensorDim::DataType> &layer_dtype_map = {},
+       ISA target_isa = ISA::AUTO) = 0;
 
   /**
    * @brief  load model with regard to the format

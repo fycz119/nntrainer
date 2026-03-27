@@ -15,6 +15,7 @@
 #define __x86_COMPUTE_BACKEND_H__
 #ifdef __cplusplus
 
+#include <common.h>
 #include <cstdint>
 #include <limits.h>
 #include <limits>
@@ -1084,16 +1085,23 @@ template <typename T = float>
 void quantize_row_q8_K(const T *src, void *dst, int64_t k);
 
 /**
- * @brief repack q40 to q40x8
+ * @brief repack q40 to q40x8 or q40x4 depending on target ISA
+ *
+ * @details This function enables cross-platform quantization by allowing
+ * specification of target ISA format regardless of current platform.
+ * For example, quantizing on x86 but saving in ARM format.
  *
  * @param W input q40
- * @param repacked_W output q40x8
+ * @param repacked_W output q40x8 (for X86) or q40x4 (for ARM)
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
+ * @param target target ISA format (AUTO uses current backend, X86 forces x86
+ * format, ARM forces ARM format)
  */
 void repack_q4_0(void *W, void *repacked_W, size_t data_size,
-                 const unsigned int M, const unsigned int N);
+                 const unsigned int M, const unsigned int N,
+                 ml::train::ISA target = ml::train::ISA::AUTO);
 
 /**
  * @brief repack q4K to q4Kx8

@@ -28,10 +28,16 @@ echo "Installing CausalLM to Android device..."
 adb shell "mkdir -p $INSTALL_DIR"
 adb shell "mkdir -p $MODEL_DIR"
 
-# Push executable
-echo "Pushing executable..."
+# Push executables
+echo "Pushing executables..."
 adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntrainer_causallm" $INSTALL_DIR/
 adb shell "chmod 755 $INSTALL_DIR/nntrainer_causallm"
+
+if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" ]; then
+    adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" $INSTALL_DIR/
+    adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
+    echo "nntr_quantize installed."
+fi
 
 # Push shared libraries
 echo "Pushing shared libraries..."
@@ -49,6 +55,16 @@ EOF"
 
 adb shell "chmod 755 $INSTALL_DIR/run_causallm.sh"
 
+# Create quantize run script on device
+adb shell "cat > $INSTALL_DIR/run_quantize.sh << 'EOF'
+#!/system/bin/sh
+export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+cd $INSTALL_DIR
+./nntr_quantize \$@
+EOF"
+
+adb shell "chmod 755 $INSTALL_DIR/run_quantize.sh"
+
 echo "Installation completed!"
 echo ""
 echo "To run CausalLM on the device:"
@@ -57,6 +73,9 @@ echo "   Example: adb push res/qwen3-4b/ $MODEL_DIR/qwen3-4b/"
 echo ""
 echo "2. Run the application:"
 echo "   adb shell $INSTALL_DIR/run_causallm.sh $MODEL_DIR/qwen3-4b"
+echo ""
+echo "(optional). Run quantization:"
+echo "   adb shell $INSTALL_DIR/run_quantize.sh $MODEL_DIR/qwen3-4b --fc_dtype Q4_0"
 echo ""
 echo "For interactive shell:"
 echo "   adb shell"
