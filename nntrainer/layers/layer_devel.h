@@ -386,26 +386,38 @@ public:
               TensorDim dim = weight.getDim();
               unsigned int K = dim.height();
               unsigned int N = dim.width();
+              const bool is_embedding_layer = (getType() == "embedding");
 
               // Skip quantization for bias-like tensors (1D with height == 1)
               // as they are not suitable for Q4_0 block quantization
               if (K == 1) {
                 weight.save(file);
               } else {
-                NNTR_THROW_IF(N % 32 != 0 || K % 32 != 0, std::invalid_argument)
-                  << "Q4_0 quantization requires both width and height to be "
-                     "divisible by 32, but got height="
-                  << K << ", width=" << N;
+                // Q4_0 blocks are formed on the n_per_row axis (size 32).
+                // For embedding, quantize over hidden dimension directly
+                // (row-wise embedding vectors). For other layers, keep the
+                // existing GEMM-oriented transposed quantization layout.
+                const unsigned int quant_rows = is_embedding_layer ? K : N;
+                const unsigned int quant_cols = is_embedding_layer ? N : K;
+                NNTR_THROW_IF(quant_cols % 32 != 0, std::invalid_argument)
+                  << "Q4_0 quantization requires blocked axis to be divisible "
+                     "by 32. layer="
+                  << getType() << ", height=" << K << ", width=" << N
+                  << ", blocked_axis=" << quant_cols;
+                NNTR_THROW_IF(quant_rows % 8 != 0, std::invalid_argument)
+                  << "Q4_0 repack requires row count divisible by 8. layer="
+                  << getType() << ", quant_rows=" << quant_rows;
 
-                Tensor weight_t = weight.transpose("0:2:1");
+                Tensor quant_src =
+                  is_embedding_layer ? weight : weight.transpose("0:2:1");
                 Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                     {Tformat::NCHW, dtype});
                 std::vector<char> tmp(quant_weight.size());
 
-                quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
-                              nullptr);
+                quantize_q4_0(quant_src.getData<float>(), tmp.data(), quant_rows,
+                              quant_cols, nullptr);
                 repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
-                            quant_weight.size(), N, K);
+                            quant_weight.size(), quant_rows, quant_cols);
                 quant_weight.save(file);
               }
             } else {

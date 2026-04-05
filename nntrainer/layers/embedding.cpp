@@ -27,6 +27,42 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 enum EmbeddingParams { weight };
 
+namespace {
+
+void embeddingForwardCommon(RunLayerContext &context, unsigned int weight_idx,
+                            unsigned int in_dim, unsigned int out_dim,
+                            unsigned int from, unsigned int to,
+                            bool is_incremental) {
+  Tensor &weight = context.getWeight(weight_idx);
+  Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+  Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  TensorDim out_tensor_dim =
+    TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
+
+  for (unsigned int b = 0; b < input_.batch(); ++b) {
+    float *in_data =
+      input_.getAddress<float>(b * input_.getDim().getFeatureLen());
+
+    Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
+    for (unsigned int i = from; i < to; ++i) {
+      unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
+      if (embed_idx >= in_dim) {
+        throw std::invalid_argument("input word index is greater than in_dim");
+      }
+
+      Tensor cur_weight =
+        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
+      const unsigned int out_pos = is_incremental ? (i - from) : i;
+      Tensor out_tensor = batchsliced_hidden.getSharedDataTensor(
+        out_tensor_dim, out_dim * out_pos);
+      out_tensor.copyData(cur_weight);
+    }
+  }
+}
+
+} // namespace
+
 EmbeddingLayer::EmbeddingLayer() :
   LayerImpl(),
   embedding_props(props::InDim(), props::OutDim()),
@@ -85,31 +121,8 @@ void EmbeddingLayer::forwarding(RunLayerContext &context, bool training) {
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim = std::get<props::InDim>(embedding_props);
   unsigned int out_dim = std::get<props::OutDim>(embedding_props);
-
-  Tensor &weight = context.getWeight(weight_idx);
-  Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
-  Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  TensorDim out_tensor_dim =
-    TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
-
-  for (unsigned int b = 0; b < input_.batch(); ++b) {
-    float *in_data =
-      input_.getAddress<float>(b * input_.getDim().getFeatureLen());
-
-    Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
-    for (unsigned int i = 0; i < input_.width(); ++i) {
-      unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
-      if (embed_idx >= in_dim) {
-        throw std::invalid_argument("input word index is greater than in_dim");
-      }
-
-      Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
-      Tensor out_tensor =
-        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * i);
-      out_tensor.copyData(cur_weight);
-    }
-  }
+  embeddingForwardCommon(context, weight_idx, in_dim, out_dim, 0,
+                         context.getInput(SINGLE_INOUT_IDX).width(), false);
 }
 
 void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
@@ -127,33 +140,7 @@ void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
     to = 1;
   }
 
-  Tensor &weight = context.getWeight(weight_idx);
-  Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
-  Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-
-  TensorDim out_tensor_dim =
-    TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
-
-  for (unsigned int b = 0; b < input_.batch(); ++b) {
-    float *in_data =
-      input_.getAddress<float>(b * input_.getDim().getFeatureLen());
-
-    Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
-    for (unsigned int i = from; i < to; ++i) {
-      unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
-      if (embed_idx >= in_dim) {
-        throw std::invalid_argument("input word index is greater than in_dim");
-      }
-
-      Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
-
-      Tensor out_tensor = batchsliced_hidden.getSharedDataTensor(
-        out_tensor_dim, out_dim * (i - from));
-
-      out_tensor.copyData(cur_weight);
-    }
-  }
+  embeddingForwardCommon(context, weight_idx, in_dim, out_dim, from, to, true);
 }
 
 void EmbeddingLayer::calcDerivative(RunLayerContext &context) {

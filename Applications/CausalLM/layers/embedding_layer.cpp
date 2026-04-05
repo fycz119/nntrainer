@@ -24,6 +24,72 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 enum EmbeddingParams { weight };
 
+namespace {
+
+void embeddingForwardCommon(nntrainer::RunLayerContext &context,
+                            unsigned int weight_idx, unsigned int in_dim,
+                            unsigned int out_dim, unsigned int token_from,
+                            unsigned int token_to, bool output_from_zero,
+                            float scale) {
+  nntrainer::Tensor &weight = context.getWeight(weight_idx);
+  nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  nntrainer::TensorDim out_tensor_dim =
+    nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
+
+  const auto weight_type = weight.getDataType();
+  const int q6_num_blocks_per_row =
+    (weight.width() + 256 - 1) / 256; // used only for Q6_K
+  const int q4_num_blocks_per_row =
+    (weight.width() + 32 - 1) / 32; // used only for Q4_0
+
+  for (unsigned int b = 0; b < input_.batch(); ++b) {
+    float *in_data =
+      input_.getAddress<float>(b * input_.getDim().getFeatureLen());
+    nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
+
+    const int iter = static_cast<int>(token_to - token_from);
+
+#pragma omp parallel for
+    for (int idx = 0; idx < iter; ++idx) {
+      const unsigned int token_idx = token_from + idx;
+      size_t embed_idx = static_cast<size_t>(in_data[token_idx]);
+      if (embed_idx >= in_dim) {
+        throw std::invalid_argument("input word index is greater than in_dim");
+      }
+
+      const unsigned int out_pos = output_from_zero ? idx : token_idx;
+      nntrainer::Tensor out_tensor = batchsliced_hidden.getSharedDataTensor(
+        out_tensor_dim, out_dim * out_pos);
+
+      if (weight_type == nntrainer::TensorDim::DataType::Q6_K) {
+        /// @note this should be replaced with quantizer operation
+        nntrainer::dequantize_row_q6_K(
+          (void *)((char *)weight.getData<uint8_t>() +
+                   (210 * q6_num_blocks_per_row) * embed_idx),
+          out_tensor.getData(), out_dim);
+      } else if (weight_type == nntrainer::TensorDim::DataType::Q4_0) {
+        /// @note this should be replaced with quantizer operation
+        nntrainer::dequantize_row_q4_0(
+          (void *)((char *)weight.getData<uint8_t>() +
+                   (18 * q4_num_blocks_per_row) * embed_idx),
+          out_tensor.getData(), out_dim);
+      } else {
+        nntrainer::Tensor cur_weight =
+          weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
+        out_tensor.copyData(cur_weight);
+      }
+
+      if (scale != 1.0f) {
+        out_tensor.multiply_i(scale);
+      }
+    }
+  }
+}
+
+} // namespace
+
 EmbeddingLayer::EmbeddingLayer() :
   LayerImpl(),
   embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim(),
@@ -84,7 +150,16 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
-                                bool training) {}
+                                bool training) {
+  unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
+  unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
+  float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
+                  ? 1.0f
+                  : std::get<nntrainer::props::Scale>(embedding_props).get();
+  embeddingForwardCommon(context, weight_idx, in_dim, out_dim, 0,
+                         context.getInput(SINGLE_INOUT_IDX).width(), false,
+                         scale);
+}
 
 void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
@@ -96,65 +171,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
                   ? 1.0f
                   : std::get<nntrainer::props::Scale>(embedding_props).get();
-  unsigned int _from = from;
-
-  nntrainer::Tensor &weight = context.getWeight(weight_idx);
-  nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-
-  nntrainer::TensorDim out_tensor_dim =
-    nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
-
-  unsigned int b_size = input_.batch();
-
-  for (unsigned int b = 0; b < b_size; ++b) {
-    float *in_data =
-      input_.getAddress<float>(b * input_.getDim().getFeatureLen());
-    nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
-
-    int iter = to - from;
-
-#pragma omp parallel for
-    for (int i = 0; i < iter; ++i) {
-      size_t embed_idx = static_cast<size_t>(in_data[i]);
-      if (embed_idx >= in_dim) {
-        throw std::invalid_argument("input word index is greater than in_dim");
-      }
-
-      nntrainer::Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
-      nntrainer::Tensor out_tensor =
-        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
-
-      if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
-        ///@note this should be replaced with quantizer operation
-        int num_blocks_per_row = (weight.width() + 256 - 1) / 256;
-        nntrainer::dequantize_row_q6_K(
-          (void *)((char *)weight.getData<uint8_t>() +
-                   (210 * num_blocks_per_row) * embed_idx),
-          out_tensor.getData(), out_dim);
-      } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
-        ///@note this should be replaced with quantizer operation
-        int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
-        nntrainer::dequantize_row_q4_0(
-          (void *)((char *)weight.getData<uint8_t>() +
-                   (18 * num_blocks_per_row) * embed_idx),
-          out_tensor.getData(), out_dim);
-      } else {
-        out_tensor.copyData(cur_weight);
-      }
-
-      if (scale != 1.0f) {
-        out_tensor.multiply_i(scale);
-      }
-    }
-
-#ifdef DEBUG
-    std::cout << context.getName() << " : "
-              << "\n input:" << input_ << "\n weight: " << weight
-              << "\n hidden: " << hidden_ << std::endl;
-#endif
-  }
+  embeddingForwardCommon(context, weight_idx, in_dim, out_dim, from, to, true,
+                         scale);
 }
 
 void EmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {
