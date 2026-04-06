@@ -114,15 +114,20 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     int iter = to - from;
 
-#pragma omp parallel for
+    /**
+     * @note Avoid throwing exceptions inside OpenMP parallel region.
+     *       Validate input indices before entering the parallel section.
+     */
     for (int i = 0; i < iter; ++i) {
       size_t embed_idx = static_cast<size_t>(in_data[i]);
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
       }
+    }
 
-      nntrainer::Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
+#pragma omp parallel for
+    for (int i = 0; i < iter; ++i) {
+      size_t embed_idx = static_cast<size_t>(in_data[i]);
       nntrainer::Tensor out_tensor =
         batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
 
@@ -141,6 +146,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                    (18 * num_blocks_per_row) * embed_idx),
           out_tensor.getData(), out_dim);
       } else {
+        nntrainer::Tensor cur_weight =
+          weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
         out_tensor.copyData(cur_weight);
       }
 
