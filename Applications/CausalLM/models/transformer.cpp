@@ -103,6 +103,12 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
+  KV_CACHE_DTYPE = nntr_cfg.contains("kv_cache_dtype")
+                     ? nntr_cfg["kv_cache_dtype"].get<std::string>()
+                     : "fp16";
+  KV_CACHE_GROUP_SIZE = nntr_cfg.contains("kv_cache_group_size")
+                          ? nntr_cfg["kv_cache_group_size"].get<unsigned int>()
+                          : 64;
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
@@ -379,6 +385,8 @@ Transformer::createAttention(const int layer_id, int seq_len, int n_heads,
     withKey("rope_theta", ROPE_THETA),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
     withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+    withKey("kv_cache_dtype", KV_CACHE_DTYPE),
+    withKey("kv_cache_group_size", KV_CACHE_GROUP_SIZE),
     withKey("input_layers", {Q, K, V})};
   layers.push_back(createLayer("mha_core", a_params));
 

@@ -80,6 +80,8 @@ std::vector<LayerHandle> GptOssForCausalLM::createAttention(
     withKey("rope_theta", ROPE_THETA),
     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+    withKey("kv_cache_dtype", KV_CACHE_DTYPE),
+    withKey("kv_cache_group_size", KV_CACHE_GROUP_SIZE),
     withKey("use_sink", "true"),
     withKey("rope_scaling_factor", ATTENTION_ROPE_SCALING_FACTOR),
     withKey("rope_scaling_type", "yarn"),

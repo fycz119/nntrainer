@@ -211,6 +211,24 @@ The following scripts are provided in `Applications/CausalLM/` to handle the bui
     ```bash
     adb shell /data/local/tmp/nntrainer/causallm/run_test_api.sh [model_name] [prompt]
     ```
+## INT8 KV Cache
+
+CausalLM attention layers can store runtime K/V cache tensors in symmetric INT8 format to reduce peak memory on long-context generation. The INT8 path is implemented in the portable `mha_core` layer, so it is available for Android/ARM builds without requiring x86-specific kernels.
+
+Enable it from `nntr_config.json`:
+
+```json
+{
+  "kv_cache_dtype": "int8",
+  "kv_cache_group_size": 64
+}
+```
+
+- `kv_cache_dtype`: `fp16` keeps the existing cache path; `int8` enables symmetric INT8 K/V cache storage with separate FP32 group scales.
+- `kv_cache_group_size`: number of head-dimension values per scale group. `64` is the default and recommended starting point for ARM phones.
+
+The system-prompt KV cache save/load path also persists INT8 cache scales when `kv_cache_dtype` is `int8`.
+
 ## Quantizing Models
 
 NNTrainer provides a quantization utility (`nntr_quantize`) that converts FP32 CausalLM model weights to lower-precision data types, reducing model size for efficient on-device inference.

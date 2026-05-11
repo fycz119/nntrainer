@@ -180,6 +180,20 @@ void CausalLM::save_kvcache(std::string path, int to_) {
           v_cache.getSharedDataTensor(v_dim, 0, true);
         k_cache_prompt.save(f);
         v_cache_prompt.save(f);
+        if (k_cache.getDataType() == ml::train::TensorDim::DataType::QINT8) {
+          auto k_scale = context.getTensor(2);
+          auto v_scale = context.getTensor(3);
+          ml::train::TensorDim k_scale_dim = k_scale.getDim();
+          ml::train::TensorDim v_scale_dim = v_scale.getDim();
+          k_scale_dim.height(to);
+          v_scale_dim.height(to);
+          nntrainer::Tensor k_scale_prompt =
+            k_scale.getSharedDataTensor(k_scale_dim, 0, true);
+          nntrainer::Tensor v_scale_prompt =
+            v_scale.getSharedDataTensor(v_scale_dim, 0, true);
+          k_scale_prompt.save(f);
+          v_scale_prompt.save(f);
+        }
       }
     };
   void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
@@ -210,6 +224,20 @@ void CausalLM::load_kvcache(std::string path, int to_) {
           v_cache.getSharedDataTensor(v_dim, 0, true);
         k_cache_prompt.read(f);
         v_cache_prompt.read(f);
+        if (k_cache.getDataType() == ml::train::TensorDim::DataType::QINT8) {
+          auto k_scale = context.getTensor(2);
+          auto v_scale = context.getTensor(3);
+          ml::train::TensorDim k_scale_dim = k_scale.getDim();
+          ml::train::TensorDim v_scale_dim = v_scale.getDim();
+          k_scale_dim.height(to);
+          v_scale_dim.height(to);
+          nntrainer::Tensor k_scale_prompt =
+            k_scale.getSharedDataTensor(k_scale_dim, 0, true);
+          nntrainer::Tensor v_scale_prompt =
+            v_scale.getSharedDataTensor(v_scale_dim, 0, true);
+          k_scale_prompt.read(f);
+          v_scale_prompt.read(f);
+        }
       }
     };
   void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));

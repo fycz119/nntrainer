@@ -170,6 +170,30 @@ public:
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
 };
 
+/**
+ * @brief KVCacheDType property
+ * - fp16: keep the existing FP16/UINT16 cache path
+ * - int8: store K/V cache as symmetric INT8 with FP32 group scales
+ */
+class KVCacheDType : public nntrainer::Property<std::string> {
+public:
+  KVCacheDType(std::string value = "fp16") { set(value); };
+  static constexpr const char *key =
+    "kv_cache_dtype";                       /**< unique key to access */
+  using prop_tag = nntrainer::str_prop_tag; /**< property type */
+};
+
+/**
+ * @brief KVCacheGroupSize property
+ */
+class KVCacheGroupSize : public nntrainer::PositiveIntegerProperty {
+public:
+  KVCacheGroupSize(unsigned int value = 64) { set(value); };
+  static constexpr const char *key =
+    "kv_cache_group_size";                   /**< unique key to access */
+  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
+};
+
 }; // namespace props
 
 /**
@@ -228,7 +252,8 @@ public:
     const unsigned int to, nntrainer::Tensor &query_step,
     nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
     nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_key,
-    nntrainer::Tensor &cache_value, ml::train::TensorDim &cache_key_dim,
+    nntrainer::Tensor &cache_value, nntrainer::Tensor &cache_key_scale,
+    nntrainer::Tensor &cache_value_scale, ml::train::TensorDim &cache_key_dim,
     ml::train::TensorDim &cache_key_step_dim,
     ml::train::TensorDim &cache_value_dim,
     ml::train::TensorDim &cache_value_step_dim);
@@ -238,7 +263,8 @@ public:
     const unsigned int to, nntrainer::Tensor &query_step,
     nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
     nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_key,
-    nntrainer::Tensor &cache_value, ml::train::TensorDim &cache_key_dim,
+    nntrainer::Tensor &cache_value, nntrainer::Tensor &cache_key_scale,
+    nntrainer::Tensor &cache_value_scale, ml::train::TensorDim &cache_key_dim,
     ml::train::TensorDim &cache_key_step_dim,
     ml::train::TensorDim &cache_value_dim,
     ml::train::TensorDim &cache_value_step_dim, nntrainer::Tensor &sink_step);
@@ -307,7 +333,8 @@ private:
     props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
-    props::AttnLogitSoftcapping, props::IsCausal>
+    props::AttnLogitSoftcapping, props::IsCausal, props::KVCacheDType,
+    props::KVCacheGroupSize>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -326,6 +353,9 @@ private:
   bool use_sink = false;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
+  bool use_int8_kv_cache = false;
+  unsigned int kv_cache_group_size = 64;
+  unsigned int kv_cache_num_groups = 1;
 
   enum INOUT_INDEX {
     /** input index */
@@ -343,6 +373,8 @@ private:
   enum AttentionParams {
     cache_key,
     cache_value,
+    cache_key_scale,
+    cache_value_scale,
     projected_key,
     projected_value,
     /** intended comment for later use of attention_mask */
@@ -351,7 +383,7 @@ private:
     dropout_mask,
     attention_output,
   };
-  std::array<unsigned int, 7> tensor_idx;
+  std::array<unsigned int, 9> tensor_idx;
   unsigned int sink_idx;
 
   /** attention parameters */
@@ -416,6 +448,17 @@ private:
                        size_t sequence_len, unsigned int num_heads,
                        unsigned int group_size, unsigned int head_dim);
 
+  void quantize_int8_cache_step(nntrainer::Tensor &in, nntrainer::Tensor &cache,
+                                nntrainer::Tensor &scale_cache,
+                                unsigned int num_cache_heads,
+                                unsigned int head_dim);
+
+  void compute_int8_kcaches(nntrainer::Tensor &in, nntrainer::Tensor &cache,
+                            nntrainer::Tensor &scale_cache,
+                            nntrainer::Tensor &out, unsigned int from,
+                            size_t sequence_len, unsigned int num_heads,
+                            unsigned int group_size, unsigned int head_dim);
+
   void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
                         unsigned int from);
 
@@ -432,6 +475,13 @@ private:
                                      nntrainer::Tensor &output, int from,
                                      int num_cache_head, int gqa_size,
                                      int head_dim, int to);
+
+  void compute_int8_vcache_transposed(nntrainer::Tensor &in,
+                                      nntrainer::Tensor &vcache,
+                                      nntrainer::Tensor &scale_cache,
+                                      nntrainer::Tensor &output, int from,
+                                      int num_cache_head, int gqa_size,
+                                      int head_dim, int to);
 
   /************** END OF  ROTARY EMBEDDING *************/
 

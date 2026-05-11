@@ -207,6 +207,8 @@ std::vector<LayerHandle> Gemma3Transformer::createAttention(
     withKey("sliding_window", window_size),
     withKey("rope_theta", std::to_string(rope_theta)),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+    withKey("kv_cache_dtype", KV_CACHE_DTYPE),
+    withKey("kv_cache_group_size", KV_CACHE_GROUP_SIZE),
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
     withKey("is_causal", IS_CAUSAL ? "true" : "false"),
     withKey("input_layers", {Q_norm, K_norm, V})};

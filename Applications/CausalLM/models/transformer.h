@@ -182,6 +182,8 @@ protected:
   std::string MODEL_TENSOR_TYPE;
   std::string EMBEDDING_DTYPE; /** embedding dtype */
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
+  std::string KV_CACHE_DTYPE = "fp16";
+  unsigned int KV_CACHE_GROUP_SIZE = 64;
 
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;
