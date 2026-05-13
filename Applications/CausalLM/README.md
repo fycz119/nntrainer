@@ -211,6 +211,10 @@ The following scripts are provided in `Applications/CausalLM/` to handle the bui
     ```bash
     adb shell /data/local/tmp/nntrainer/causallm/run_test_api.sh [model_name] [prompt]
     ```
+## Mobile NEON TPS Optimization
+
+For an implementation-oriented roadmap to improve Android phone decode TPS with ARM NEON, see [`docs/neon_tps_optimization_plan.md`](docs/neon_tps_optimization_plan.md).
+
 ## Quantizing Models
 
 NNTrainer provides a quantization utility (`nntr_quantize`) that converts FP32 CausalLM model weights to lower-precision data types, reducing model size for efficient on-device inference.
