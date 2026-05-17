@@ -24,15 +24,131 @@
 
 #include <acti_func.h>
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <node_exporter.h>
 #include <omp.h>
 #include <qwen_moe_layer_fsu.h>
 #include <stdexcept>
+#include <utility>
 
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
+static constexpr size_t MOE_EXPERT_CACHE_CAPACITY = 4;
+static constexpr bool MOE_INTERNAL_PROFILE_ENABLED = true;
+static constexpr size_t MOE_PROFILE_STAGE_COUNT =
+  static_cast<size_t>(SlimMoELayer::ProfileStage::Count);
+
+namespace {
+
+std::array<std::atomic<uint64_t>, MOE_PROFILE_STAGE_COUNT>
+  profile_total_us = {};
+std::array<std::atomic<uint64_t>, MOE_PROFILE_STAGE_COUNT> profile_count = {};
+
+const char *getProfileStageName(SlimMoELayer::ProfileStage stage) {
+  switch (stage) {
+  case SlimMoELayer::ProfileStage::IncrementalTotal:
+    return "incremental_total";
+  case SlimMoELayer::ProfileStage::SingleTokenFastPath:
+    return "single_token_fast_path";
+  case SlimMoELayer::ProfileStage::InputSlice:
+    return "input_slice";
+  case SlimMoELayer::ProfileStage::RouterDot:
+    return "router_dot";
+  case SlimMoELayer::ProfileStage::RouterSoftmax:
+    return "router_softmax";
+  case SlimMoELayer::ProfileStage::RouterTopK:
+    return "router_topk";
+  case SlimMoELayer::ProfileStage::TopKNorm:
+    return "topk_norm";
+  case SlimMoELayer::ProfileStage::AssignmentBuild:
+    return "assignment_build";
+  case SlimMoELayer::ProfileStage::ExpertOutputAlloc:
+    return "expert_output_alloc";
+  case SlimMoELayer::ProfileStage::ActiveExpertBuild:
+    return "active_expert_build";
+  case SlimMoELayer::ProfileStage::WeightCacheHit:
+    return "weight_cache_hit";
+  case SlimMoELayer::ProfileStage::WeightCacheMiss:
+    return "weight_cache_miss";
+  case SlimMoELayer::ProfileStage::WeightCacheEvict:
+    return "weight_cache_evict";
+  case SlimMoELayer::ProfileStage::WeightActivate:
+    return "weight_activate";
+  case SlimMoELayer::ProfileStage::ExpertComputeTotal:
+    return "expert_compute_total";
+  case SlimMoELayer::ProfileStage::ExpertGateDot:
+    return "expert_gate_dot";
+  case SlimMoELayer::ProfileStage::ExpertActivation:
+    return "expert_activation";
+  case SlimMoELayer::ProfileStage::ExpertUpDot:
+    return "expert_up_dot";
+  case SlimMoELayer::ProfileStage::ExpertMul:
+    return "expert_mul";
+  case SlimMoELayer::ProfileStage::ExpertDownDot:
+    return "expert_down_dot";
+  case SlimMoELayer::ProfileStage::ExpertScaleAdd:
+    return "expert_scale_add";
+  case SlimMoELayer::ProfileStage::WeightDeactivate:
+    return "weight_deactivate";
+  case SlimMoELayer::ProfileStage::OutputCombine:
+    return "output_combine";
+  case SlimMoELayer::ProfileStage::Count:
+    break;
+  }
+  return "unknown";
+}
+
+class MoEProfileScope {
+public:
+  explicit MoEProfileScope(SlimMoELayer::ProfileStage stage_) :
+    stage(stage_) {
+    if constexpr (MOE_INTERNAL_PROFILE_ENABLED)
+      start = std::chrono::high_resolution_clock::now();
+  }
+
+  ~MoEProfileScope() {
+    if constexpr (!MOE_INTERNAL_PROFILE_ENABLED)
+      return;
+    auto end = std::chrono::high_resolution_clock::now();
+    auto elapsed =
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+        .count();
+    auto idx = static_cast<size_t>(stage);
+    profile_total_us[idx].fetch_add(static_cast<uint64_t>(elapsed),
+                                    std::memory_order_relaxed);
+    profile_count[idx].fetch_add(1, std::memory_order_relaxed);
+  }
+
+private:
+  SlimMoELayer::ProfileStage stage;
+  std::chrono::high_resolution_clock::time_point start;
+};
+
+} // namespace
+
+void SlimMoELayer::resetProfileStats() {
+  for (size_t i = 0; i < MOE_PROFILE_STAGE_COUNT; ++i) {
+    profile_total_us[i].store(0, std::memory_order_relaxed);
+    profile_count[i].store(0, std::memory_order_relaxed);
+  }
+}
+
+std::vector<SlimMoELayer::ProfileStat> SlimMoELayer::getProfileStats() {
+  std::vector<ProfileStat> stats;
+  stats.reserve(MOE_PROFILE_STAGE_COUNT);
+  for (size_t i = 0; i < MOE_PROFILE_STAGE_COUNT; ++i) {
+    auto count = profile_count[i].load(std::memory_order_relaxed);
+    auto total_us = profile_total_us[i].load(std::memory_order_relaxed);
+    stats.push_back(
+      {getProfileStageName(static_cast<ProfileStage>(i)), total_us, count,
+       count == 0 ? 0.0 : static_cast<double>(total_us) / count});
+  }
+  return stats;
+}
 
 SlimMoELayer::SlimMoELayer() :
   LayerImpl(),
@@ -43,6 +159,9 @@ SlimMoELayer::SlimMoELayer() :
   expert_gate_proj_indices({}),
   expert_up_proj_indices({}),
   expert_down_proj_indices({}),
+  loaded_expert_deque({}),
+  iteration_map({}),
+  need_load({}),
   gate_idx(std::numeric_limits<unsigned>::max()),
   router_logits_idx(std::numeric_limits<unsigned>::max()),
   expert_mask_idx(std::numeric_limits<unsigned>::max()) {}
@@ -139,6 +258,7 @@ void SlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
       weight_regularizer_constant, weight_decay,
       "expert_down_" + std::to_string(i), false, true));
   }
+  need_load.assign(num_experts, true);
 
   // 6. Request intermediate tensors
   const unsigned batch_size = in_dim.batch();
@@ -180,9 +300,19 @@ void SlimMoELayer::forwarding(nntrainer::RunLayerContext &context,
 
   // routing
   nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
-  input.dot(gate_weights, router_logits);
-  router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
-  auto topk_result = router_logits.topK(topk);
+  {
+    MoEProfileScope scope(ProfileStage::RouterDot);
+    input.dot(gate_weights, router_logits);
+  }
+  {
+    MoEProfileScope scope(ProfileStage::RouterSoftmax);
+    router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
+  }
+  std::pair<nntrainer::Tensor, nntrainer::Tensor> topk_result;
+  {
+    MoEProfileScope scope(ProfileStage::RouterTopK);
+    topk_result = router_logits.topK(topk);
+  }
   auto topk_values = std::get<0>(topk_result);
   auto topk_indices = std::get<1>(topk_result);
 
@@ -197,11 +327,14 @@ void SlimMoELayer::forwarding(nntrainer::RunLayerContext &context,
   // Pre-compute expert token assignments for better cache locality
   std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
     num_experts);
-  for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
-    for (int k = 0; k < static_cast<int>(topk); ++k) {
-      unsigned expert_idx = indices_data[i * topk + k];
-      float weight = topk_values.getValue<float>(i, 0, 0, k);
-      expert_assignments[expert_idx].emplace_back(i, weight);
+  {
+    MoEProfileScope scope(ProfileStage::AssignmentBuild);
+    for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
+      for (int k = 0; k < static_cast<int>(topk); ++k) {
+        unsigned expert_idx = indices_data[i * topk + k];
+        float weight = topk_values.getValue<float>(i, 0, 0, k);
+        expert_assignments[expert_idx].emplace_back(i, weight);
+      }
     }
   }
 
@@ -223,20 +356,29 @@ void SlimMoELayer::forwarding(nntrainer::RunLayerContext &context,
     ///      which is not allocated so far. It will be allocated when it is
     ///      used. `activate(read=true)` will allocate its memory and will read
     ///      from the original weight. activate is true by default. i.e., mmap
-    expert_gate_proj.activate();
-    expert_up_proj.activate();
-    expert_down_proj.activate();
+    {
+      MoEProfileScope scope(ProfileStage::WeightActivate);
+      expert_gate_proj.activate();
+      expert_up_proj.activate();
+      expert_down_proj.activate();
+    }
 
     // Use optimized expert forward computation without memory copies
-    compute_expert_forward(input, output, assignments, expert_gate_proj,
-                           expert_up_proj, expert_down_proj, hidden_size);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertComputeTotal);
+      compute_expert_forward(input, output, assignments, expert_gate_proj,
+                             expert_up_proj, expert_down_proj, hidden_size);
+    }
 
     ////@note Please note that the virtual tensor is deactivated after usage
     ////      This will allocate and load data from the storage on-the-fly
     ////      i.e., unmap
-    expert_gate_proj.deactivate();
-    expert_up_proj.deactivate();
-    expert_down_proj.deactivate();
+    {
+      MoEProfileScope scope(ProfileStage::WeightDeactivate);
+      expert_gate_proj.deactivate();
+      expert_up_proj.deactivate();
+      expert_down_proj.deactivate();
+    }
   }
 
   // reshape output: [B*S,1,1,H] -> [B,1,S,H]
@@ -285,28 +427,46 @@ inline void SlimMoELayer::compute_expert_forward(
     nntrainer::Tensor up_out(intermediate_dim);
 
     // Gate projection using optimized dot operation
-    token_input.dot(gate_proj, gate_out);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertGateDot);
+      token_input.dot(gate_proj, gate_out);
+    }
 
     // Apply activation (silu)
-    acti_func.run_fn(gate_out, acti_out);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertActivation);
+      acti_func.run_fn(gate_out, acti_out);
+    }
 
     // Up projection using optimized dot operation
-    token_input.dot(up_proj, up_out);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertUpDot);
+      token_input.dot(up_proj, up_out);
+    }
 
     // Element-wise multiply: silu(gate_out) * up_out
-    acti_out.multiply_i(up_out);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertMul);
+      acti_out.multiply_i(up_out);
+    }
 
     // Down projection using optimized dot operation
     nntrainer::Tensor token_expert_output(token_output_dim);
-    acti_out.dot(down_proj, token_expert_output);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertDownDot);
+      acti_out.dot(down_proj, token_expert_output);
+    }
 
     // Apply weight and accumulate to expert's temporary output
-    token_expert_output.multiply_i(weight);
-    size_t output_offset = token_idx * hidden_size;
-    nntrainer::Tensor token_output =
-      expert_output.getSharedDataTensor(token_output_dim, output_offset, true);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertScaleAdd);
+      token_expert_output.multiply_i(weight);
+      size_t output_offset = token_idx * hidden_size;
+      nntrainer::Tensor token_output =
+        expert_output.getSharedDataTensor(token_output_dim, output_offset, true);
 
-    token_output.add_i(token_expert_output);
+      token_output.add_i(token_expert_output);
+    }
   }
 
   // Add expert's result to final output (no critical section in sequential
@@ -350,35 +510,230 @@ inline void SlimMoELayer::compute_expert_forward_no_critical(
     nntrainer::Tensor up_out(intermediate_dim);
 
     // Gate projection using optimized dot operation
-    token_input.dot(gate_proj, gate_out);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertGateDot);
+      token_input.dot(gate_proj, gate_out);
+    }
 
     // Apply activation (silu)
-    acti_func.run_fn(gate_out, acti_out);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertActivation);
+      acti_func.run_fn(gate_out, acti_out);
+    }
 
     // Up projection using optimized dot operation
-    token_input.dot(up_proj, up_out);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertUpDot);
+      token_input.dot(up_proj, up_out);
+    }
 
     // Element-wise multiply: silu(gate_out) * up_out
-    acti_out.multiply_i(up_out);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertMul);
+      acti_out.multiply_i(up_out);
+    }
 
     // Down projection using optimized dot operation
     nntrainer::Tensor token_expert_output(token_output_dim);
-    acti_out.dot(down_proj, token_expert_output);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertDownDot);
+      acti_out.dot(down_proj, token_expert_output);
+    }
 
     // Apply weight and accumulate to expert's output (no critical section
     // needed)
-    token_expert_output.multiply_i(weight);
-    size_t output_offset = token_idx * hidden_size;
-    nntrainer::Tensor token_output =
-      expert_output.getSharedDataTensor(token_output_dim, output_offset, true);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertScaleAdd);
+      token_expert_output.multiply_i(weight);
+      size_t output_offset = token_idx * hidden_size;
+      nntrainer::Tensor token_output =
+        expert_output.getSharedDataTensor(token_output_dim, output_offset, true);
 
-    token_output.add_i(token_expert_output);
+      token_output.add_i(token_expert_output);
+    }
+  }
+}
+
+inline void SlimMoELayer::compute_single_token_expert(
+  const nntrainer::Tensor &token_input, nntrainer::Tensor &output,
+  const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
+  const nntrainer::Tensor &down_proj, float weight,
+  unsigned int hidden_size) {
+
+  const unsigned intermediate_size = gate_proj.width();
+  nntrainer::TensorDim intermediate_dim({1, 1, 1, intermediate_size},
+                                        token_input.getTensorType());
+  nntrainer::TensorDim token_output_dim({1, 1, 1, hidden_size},
+                                        token_input.getTensorType());
+
+  nntrainer::Tensor gate_out(intermediate_dim);
+  nntrainer::Tensor acti_out(intermediate_dim);
+  nntrainer::Tensor up_out(intermediate_dim);
+
+  {
+    MoEProfileScope scope(ProfileStage::ExpertGateDot);
+    token_input.dot(gate_proj, gate_out);
+  }
+  {
+    MoEProfileScope scope(ProfileStage::ExpertActivation);
+    acti_func.run_fn(gate_out, acti_out);
+  }
+  {
+    MoEProfileScope scope(ProfileStage::ExpertUpDot);
+    token_input.dot(up_proj, up_out);
+  }
+  {
+    MoEProfileScope scope(ProfileStage::ExpertMul);
+    acti_out.multiply_i(up_out);
+  }
+
+  nntrainer::Tensor token_expert_output(token_output_dim);
+  {
+    MoEProfileScope scope(ProfileStage::ExpertDownDot);
+    acti_out.dot(down_proj, token_expert_output);
+  }
+  {
+    MoEProfileScope scope(ProfileStage::ExpertScaleAdd);
+    token_expert_output.multiply_i(weight);
+    output.add_i(token_expert_output);
+  }
+}
+
+void SlimMoELayer::incremental_forwarding_single_token(
+  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
+  bool training) {
+
+  (void)from;
+  (void)to;
+  (void)training;
+
+  MoEProfileScope fast_path_scope(ProfileStage::SingleTokenFastPath);
+
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &router_logits_ = context.getTensor(router_logits_idx);
+
+  nntrainer::TensorDim input_step_dim = input_.getDim();
+  nntrainer::TensorDim output_step_dim = output_.getDim();
+  nntrainer::TensorDim router_logits_step_dim = router_logits_.getDim();
+
+  input_step_dim.batch(1);
+  input_step_dim.height(1);
+  output_step_dim.batch(1);
+  output_step_dim.height(1);
+  router_logits_step_dim.batch(1);
+  router_logits_step_dim.height(1);
+
+  for (unsigned int b = 0; b < input_.batch(); ++b) {
+    nntrainer::Tensor input;
+    nntrainer::Tensor output;
+    nntrainer::Tensor router_logits;
+    {
+      MoEProfileScope scope(ProfileStage::InputSlice);
+      input = input_.getSharedDataTensor(
+        input_step_dim, b * input_step_dim.getFeatureLen(), true);
+      output = output_.getSharedDataTensor(
+        output_step_dim, b * output_step_dim.getFeatureLen(), true);
+      router_logits =
+        router_logits_.getSharedDataTensor(router_logits_step_dim, 0, true);
+    }
+
+    const unsigned hidden_size = input.width();
+    input.reshape({1, 1, 1, hidden_size});
+    output.reshape({1, 1, 1, hidden_size});
+    output.setZero();
+
+    nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
+    {
+      MoEProfileScope scope(ProfileStage::RouterDot);
+      input.dot(gate_weights, router_logits);
+    }
+    {
+      MoEProfileScope scope(ProfileStage::RouterSoftmax);
+      router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
+    }
+
+    std::pair<nntrainer::Tensor, nntrainer::Tensor> topk_result;
+    {
+      MoEProfileScope scope(ProfileStage::RouterTopK);
+      topk_result = router_logits.topK(topk);
+    }
+    auto topk_values = std::get<0>(topk_result);
+    auto topk_indices = std::get<1>(topk_result);
+
+    float *values_data = topk_values.getData<float>();
+    const uint32_t *indices_data = topk_indices.getData<uint32_t>();
+
+    {
+      MoEProfileScope scope(ProfileStage::TopKNorm);
+      float sum = 0.0f;
+      for (unsigned int k = 0; k < topk; ++k)
+        sum += values_data[k];
+      if (sum != 0.0f) {
+        for (unsigned int k = 0; k < topk; ++k)
+          values_data[k] /= sum;
+      }
+    }
+
+    std::vector<nntrainer::Tensor> expert_outputs(topk);
+    {
+      MoEProfileScope scope(ProfileStage::ExpertOutputAlloc);
+      for (unsigned int k = 0; k < topk; ++k) {
+        expert_outputs[k] =
+          nntrainer::Tensor(1, 1, 1, hidden_size, output.getTensorType());
+        expert_outputs[k].setZero();
+      }
+    }
+
+#pragma omp parallel for schedule(static)
+    for (int k = 0; k < static_cast<int>(topk); ++k) {
+      const unsigned expert_idx = indices_data[k];
+      const float weight = values_data[k];
+
+      {
+        MoEProfileScope scope(ProfileStage::WeightActivate);
+        context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
+        context.getWeight(expert_up_proj_indices[expert_idx]).activate();
+        context.getWeight(expert_down_proj_indices[expert_idx]).activate();
+      }
+
+      {
+        MoEProfileScope scope(ProfileStage::ExpertComputeTotal);
+        compute_single_token_expert(
+          input, expert_outputs[k],
+          context.getWeight(expert_gate_proj_indices[expert_idx]),
+          context.getWeight(expert_up_proj_indices[expert_idx]),
+          context.getWeight(expert_down_proj_indices[expert_idx]), weight,
+          hidden_size);
+      }
+
+      {
+        MoEProfileScope scope(ProfileStage::WeightDeactivate);
+        context.getWeight(expert_gate_proj_indices[expert_idx]).deactivate();
+        context.getWeight(expert_up_proj_indices[expert_idx]).deactivate();
+        context.getWeight(expert_down_proj_indices[expert_idx]).deactivate();
+      }
+    }
+
+    {
+      MoEProfileScope scope(ProfileStage::OutputCombine);
+      for (unsigned int k = 0; k < topk; ++k)
+        output.add_i(expert_outputs[k]);
+    }
+
+    output.reshape({1, 1, 1, hidden_size});
   }
 }
 
 void SlimMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int from, unsigned int to,
                                           bool training) {
+
+  MoEProfileScope total_scope(ProfileStage::IncrementalTotal);
+
+  // Keep using the general expert-parallel path for single-token generation.
+  // A specialized top-K path was tested and was slower on Android because the
+  // extra per-token tensor setup outweighed the removed bookkeeping.
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -398,12 +753,18 @@ void SlimMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
   for (unsigned int b = 0; b < input_.batch(); ++b) {
 
-    auto input = input_.getSharedDataTensor(
-      input_step_dim, b * input_step_dim.getFeatureLen(), true);
-    auto output = output_.getSharedDataTensor(
-      output_step_dim, b * output_step_dim.getFeatureLen(), true);
-    auto router_logits =
-      router_logits_.getSharedDataTensor(router_logits_step_dim, 0, true);
+    nntrainer::Tensor input;
+    nntrainer::Tensor output;
+    nntrainer::Tensor router_logits;
+    {
+      MoEProfileScope scope(ProfileStage::InputSlice);
+      input = input_.getSharedDataTensor(
+        input_step_dim, b * input_step_dim.getFeatureLen(), true);
+      output = output_.getSharedDataTensor(
+        output_step_dim, b * output_step_dim.getFeatureLen(), true);
+      router_logits =
+        router_logits_.getSharedDataTensor(router_logits_step_dim, 0, true);
+    }
 
     const unsigned batch_size = input.batch();
     const unsigned seq_len = input.height();
@@ -419,71 +780,172 @@ void SlimMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     // routing
     nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
-    input.dot(gate_weights, router_logits);
-    router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
-    auto topk_result = router_logits.topK(topk);
+    {
+      MoEProfileScope scope(ProfileStage::RouterDot);
+      input.dot(gate_weights, router_logits);
+    }
+    {
+      MoEProfileScope scope(ProfileStage::RouterSoftmax);
+      router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
+    }
+    std::pair<nntrainer::Tensor, nntrainer::Tensor> topk_result;
+    {
+      MoEProfileScope scope(ProfileStage::RouterTopK);
+      topk_result = router_logits.topK(topk);
+    }
     auto topk_values = std::get<0>(topk_result);
     auto topk_indices = std::get<1>(topk_result);
 
     // norm_topk_prob
-    topk_values.divide_i(topk_values.sum(3));
+    {
+      MoEProfileScope scope(ProfileStage::TopKNorm);
+      topk_values.divide_i(topk_values.sum(3));
+    }
 
     const uint32_t *indices_data = topk_indices.getData<uint32_t>();
     std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
       num_experts);
     // Set expert mask
-    for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
-      for (int k = 0; k < static_cast<int>(topk); ++k) {
-        unsigned expert_idx = indices_data[i * topk + k];
-        float weight = topk_values.getValue<float>(i, 0, 0, k);
-        expert_assignments[expert_idx].emplace_back(i, weight);
+    {
+      MoEProfileScope scope(ProfileStage::AssignmentBuild);
+      for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
+        for (int k = 0; k < static_cast<int>(topk); ++k) {
+          unsigned expert_idx = indices_data[i * topk + k];
+          float weight = topk_values.getValue<float>(i, 0, 0, k);
+          expert_assignments[expert_idx].emplace_back(i, weight);
+        }
       }
     }
 
     // Parallel processing for multiple tokens with many active experts
     std::vector<nntrainer::Tensor> expert_outputs(num_experts);
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      if (!expert_assignments[expert_idx].empty()) {
-        expert_outputs[expert_idx] = nntrainer::Tensor(
-          total_tokens, 1, 1, hidden_size, output.getTensorType());
+    {
+      MoEProfileScope scope(ProfileStage::ExpertOutputAlloc);
+      for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
+           ++expert_idx) {
+        if (!expert_assignments[expert_idx].empty()) {
+          expert_outputs[expert_idx] = nntrainer::Tensor(
+            total_tokens, 1, 1, hidden_size, output.getTensorType());
+        }
+      }
+    }
+
+    std::vector<int> target_idx_vector;
+    target_idx_vector.reserve(topk);
+    {
+      MoEProfileScope scope(ProfileStage::ActiveExpertBuild);
+      for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
+           ++expert_idx) {
+        if (!expert_assignments[expert_idx].empty())
+          target_idx_vector.push_back(expert_idx);
       }
     }
 
 #pragma omp parallel for schedule(dynamic)
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
+    for (int target_idx = 0; target_idx < static_cast<int>(target_idx_vector.size());
+         ++target_idx) {
+      const int expert_idx = target_idx_vector[target_idx];
       const auto &assignments = expert_assignments[expert_idx];
-      if (assignments.empty())
-        continue;
 
       ///@note Please note that expert_gate_proj is virtual tensor,
       ///      which is not allocated so far. It will be allocated when it is
       ///      used. `activate(read=true)` will allocate its memory and will
       ///      read from the original weight. activate is true by default. i.e.,
       ///      mmap
-      context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
-      context.getWeight(expert_up_proj_indices[expert_idx]).activate();
-      context.getWeight(expert_down_proj_indices[expert_idx]).activate();
+      if constexpr (MOE_EXPERT_CACHE_CAPACITY == 0) {
+        {
+          MoEProfileScope scope(ProfileStage::WeightActivate);
+          context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
+          context.getWeight(expert_up_proj_indices[expert_idx]).activate();
+          context.getWeight(expert_down_proj_indices[expert_idx]).activate();
+        }
 
-      compute_expert_forward_no_critical(
-        input, expert_outputs[expert_idx], assignments,
-        context.getWeight(expert_gate_proj_indices[expert_idx]),
-        context.getWeight(expert_up_proj_indices[expert_idx]),
-        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+        {
+          MoEProfileScope scope(ProfileStage::ExpertComputeTotal);
+          compute_expert_forward_no_critical(
+            input, expert_outputs[expert_idx], assignments,
+            context.getWeight(expert_gate_proj_indices[expert_idx]),
+            context.getWeight(expert_up_proj_indices[expert_idx]),
+            context.getWeight(expert_down_proj_indices[expert_idx]),
+            hidden_size);
+        }
 
-      ////@note Please note that the virtual tensor is deactivated after usage
-      ////      This will allocate and load data from the storage on-the-fly
-      ////      i.e., unmap
-      context.getWeight(expert_gate_proj_indices[expert_idx]).deactivate();
-      context.getWeight(expert_up_proj_indices[expert_idx]).deactivate();
-      context.getWeight(expert_down_proj_indices[expert_idx]).deactivate();
+        {
+          MoEProfileScope scope(ProfileStage::WeightDeactivate);
+          context.getWeight(expert_gate_proj_indices[expert_idx]).deactivate();
+          context.getWeight(expert_up_proj_indices[expert_idx]).deactivate();
+          context.getWeight(expert_down_proj_indices[expert_idx]).deactivate();
+        }
+        continue;
+      }
+
+      bool cache_miss = false;
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache_miss = need_load[expert_idx];
+        if (!cache_miss) {
+          MoEProfileScope scope(ProfileStage::WeightCacheHit);
+          auto iter = iteration_map.find(expert_idx);
+          if (iter != iteration_map.end()) {
+            loaded_expert_deque.erase(iter->second);
+            loaded_expert_deque.push_back(expert_idx);
+            iteration_map[expert_idx] = --loaded_expert_deque.end();
+          }
+        }
+      }
+
+      if (cache_miss) {
+        {
+          MoEProfileScope scope(ProfileStage::WeightCacheMiss);
+        }
+        {
+          MoEProfileScope scope(ProfileStage::WeightActivate);
+          context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
+          context.getWeight(expert_up_proj_indices[expert_idx]).activate();
+          context.getWeight(expert_down_proj_indices[expert_idx]).activate();
+        }
+        {
+          std::lock_guard<std::mutex> lock(cache_mutex);
+          loaded_expert_deque.push_back(expert_idx);
+          iteration_map[expert_idx] = --loaded_expert_deque.end();
+          need_load[expert_idx] = false;
+        }
+      }
+
+      {
+        MoEProfileScope scope(ProfileStage::ExpertComputeTotal);
+        compute_expert_forward_no_critical(
+          input, expert_outputs[expert_idx], assignments,
+          context.getWeight(expert_gate_proj_indices[expert_idx]),
+          context.getWeight(expert_up_proj_indices[expert_idx]),
+          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+      }
+    }
+
+    while (true) {
+      int evict_idx = -1;
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (loaded_expert_deque.size() <= MOE_EXPERT_CACHE_CAPACITY)
+          break;
+        evict_idx = loaded_expert_deque.front();
+        loaded_expert_deque.pop_front();
+        iteration_map.erase(evict_idx);
+        need_load[evict_idx] = true;
+      }
+      {
+        MoEProfileScope evict_scope(ProfileStage::WeightCacheEvict);
+        MoEProfileScope deactivate_scope(ProfileStage::WeightDeactivate);
+        context.getWeight(expert_gate_proj_indices[evict_idx]).deactivate();
+        context.getWeight(expert_up_proj_indices[evict_idx]).deactivate();
+        context.getWeight(expert_down_proj_indices[evict_idx]).deactivate();
+      }
     }
 
     // Combine expert outputs
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      if (!expert_assignments[expert_idx].empty()) {
+    {
+      MoEProfileScope scope(ProfileStage::OutputCombine);
+      for (int expert_idx : target_idx_vector) {
         output.add_i(expert_outputs[expert_idx]);
       }
     }

@@ -12,6 +12,9 @@
  *         This code is a part of the break down version of the mha layer.
  */
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <mutex>
 #include <omp.h>
@@ -36,6 +39,66 @@ inline float convert_scalar(uint16_t h) {
 namespace causallm {
 
 #define tile_size 4
+
+namespace {
+
+using MHAProfileClock = std::chrono::steady_clock;
+constexpr bool MHA_PROFILE_ENABLED = true;
+
+constexpr size_t profile_stage_count =
+  static_cast<size_t>(MHACoreLayer::ProfileStage::Count);
+
+constexpr std::array<const char *, profile_stage_count> profile_stage_names = {
+  "incremental_forwarding", "one_batch_forwarding", "tensor_slice",
+  "rope_query",             "rope_key",             "value_cache_write",
+  "qk_out_alloc",           "qk_compute",           "softmax",
+  "av_compute",
+};
+
+std::array<std::atomic<uint64_t>, profile_stage_count> profile_total_us;
+std::array<std::atomic<uint64_t>, profile_stage_count> profile_count;
+
+void addProfileDuration(MHACoreLayer::ProfileStage stage, uint64_t us) {
+  if constexpr (!MHA_PROFILE_ENABLED)
+    return;
+  size_t index = static_cast<size_t>(stage);
+  profile_total_us[index].fetch_add(us, std::memory_order_relaxed);
+  profile_count[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t elapsedProfileUs(MHAProfileClock::time_point start) {
+  auto end = MHAProfileClock::now();
+  return static_cast<uint64_t>(
+    std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+      .count());
+}
+
+class MHAProfileScope {
+public:
+  explicit MHAProfileScope(MHACoreLayer::ProfileStage stage_) :
+    stage(stage_) {
+    if constexpr (MHA_PROFILE_ENABLED)
+      start = MHAProfileClock::now();
+  }
+
+  ~MHAProfileScope() {
+    if constexpr (!MHA_PROFILE_ENABLED)
+      return;
+    auto end = MHAProfileClock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+                .count();
+    addProfileDuration(stage, static_cast<uint64_t>(us));
+  }
+
+private:
+  MHACoreLayer::ProfileStage stage;
+  MHAProfileClock::time_point start;
+};
+
+#define MHA_PROFILE_SCOPE(stage)                                               \
+  MHAProfileScope mha_profile_scope_##__LINE__(stage)
+
+} // namespace
 
 /************************************************************** */
 
@@ -64,6 +127,25 @@ MHACoreLayer::MHACoreLayer() :
 }
 
 MHACoreLayer::~MHACoreLayer() {}
+
+void MHACoreLayer::resetProfileStats() {
+  for (size_t i = 0; i < profile_stage_count; ++i) {
+    profile_total_us[i].store(0, std::memory_order_relaxed);
+    profile_count[i].store(0, std::memory_order_relaxed);
+  }
+}
+
+std::vector<MHACoreLayer::ProfileStat> MHACoreLayer::getProfileStats() {
+  std::vector<ProfileStat> stats;
+  stats.reserve(profile_stage_count);
+  for (size_t i = 0; i < profile_stage_count; ++i) {
+    uint64_t total_us = profile_total_us[i].load(std::memory_order_relaxed);
+    uint64_t count = profile_count[i].load(std::memory_order_relaxed);
+    double avg_us = count == 0 ? 0.0 : static_cast<double>(total_us) / count;
+    stats.push_back({profile_stage_names[i], total_us, count, avg_us});
+  }
+  return stats;
+}
 
 /************************************************************** */
 
@@ -202,6 +284,8 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
+  MHA_PROFILE_SCOPE(ProfileStage::IncrementalForwarding);
+
   /// @todo replace step_size into input height
   unsigned int step_size = _to - _from;
 
@@ -470,6 +554,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   ml::train::TensorDim &cache_key_step_dim,
   ml::train::TensorDim &cache_value_dim,
   ml::train::TensorDim &cache_value_step_dim) {
+  MHA_PROFILE_SCOPE(ProfileStage::BatchForwarding);
 
   /**
    *
@@ -485,34 +570,50 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   auto &pool =
     nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
 
-  nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
-    cache_key_step_dim,
-    batch * cache_key_dim.getFeatureLen() + cache_index * cache_key_dim.width(),
-    true);
-  nntrainer::Tensor b_cache_value_step =
-    cache_value.getSharedDataTensor(cache_value_step_dim,
-                                    batch * cache_value_dim.getFeatureLen() +
-                                      cache_index * cache_value_dim.width(),
-                                    true);
+  nntrainer::Tensor b_cache_key_step;
+  nntrainer::Tensor b_cache_value_step;
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::TensorSlice);
+    b_cache_key_step = cache_key.getSharedDataTensor(
+      cache_key_step_dim,
+      batch * cache_key_dim.getFeatureLen() +
+        cache_index * cache_key_dim.width(),
+      true);
+    b_cache_value_step =
+      cache_value.getSharedDataTensor(cache_value_step_dim,
+                                      batch * cache_value_dim.getFeatureLen() +
+                                        cache_index * cache_value_dim.width(),
+                                      true);
+  }
 
   // apply rotary embedding for query
-  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
-                             false);
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::RopeQuery);
+    apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
+                               false);
+  }
 
   // append kcache with rotary embedding
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
-                             false);
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::RopeKey);
+    apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
+                               cache_index, false);
+  }
 
   // append vcache without rotary embedding
-  if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
-                               cache_index, true);
-  } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::ValueCacheWrite);
+    if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
+                                 cache_index, true);
+    } else if (query_step.getDataType() ==
+               ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
+      b_cache_value_step.copyData(value_step);
 #else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+      NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
+    }
   }
 
   /// @todo replace step_size into input height
@@ -531,22 +632,35 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
 
   // out_ stores the output of Q * K
+  auto qk_out_alloc_start = MHAProfileClock::now();
   nntrainer::Tensor out_(
     1, 1,
     is_causal ? (calc_attn_index(cache_to) - calc_attn_index(cache_from))
               : (step_size * cache_to),
     num_heads_Q, query_step.getTensorType());
+  addProfileDuration(ProfileStage::QKOutAlloc,
+                     elapsedProfileUs(qk_out_alloc_start));
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
-  compute_kcaches(query_step, b_cached_key, out_, cache_from,
-                  cache_to - cache_from, num_heads_Q, gqa_size, head_dim, pool);
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::QKCompute);
+    compute_kcaches(query_step, b_cached_key, out_, cache_from,
+                    cache_to - cache_from, num_heads_Q, gqa_size, head_dim,
+                    pool);
+  }
 
-  softmax_triangle(out_, step_size, num_heads_Q, cache_from, pool);
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::Softmax);
+    softmax_triangle(out_, step_size, num_heads_Q, cache_from, pool);
+  }
 
-  compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
-                                cache_from, num_heads_KV, gqa_size, head_dim,
-                                cache_to, pool);
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::AVCompute);
+    compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
+                                  cache_from, num_heads_KV, gqa_size, head_dim,
+                                  cache_to, pool);
+  }
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
@@ -558,6 +672,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   ml::train::TensorDim &cache_key_step_dim,
   ml::train::TensorDim &cache_value_dim,
   ml::train::TensorDim &cache_value_step_dim, nntrainer::Tensor &sink_step) {
+  MHA_PROFILE_SCOPE(ProfileStage::BatchForwarding);
+
   /// @todo replace from, to into cache_index, input height
   /// @note currently, only gpt-oss uses this method
 
@@ -578,28 +694,44 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   auto &pool =
     nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
 
-  nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
-    cache_key_step_dim,
-    batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(), true);
-  nntrainer::Tensor b_cache_value_step = cache_value.getSharedDataTensor(
-    cache_value_step_dim,
-    batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
-    true);
+  nntrainer::Tensor b_cache_key_step;
+  nntrainer::Tensor b_cache_value_step;
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::TensorSlice);
+    b_cache_key_step = cache_key.getSharedDataTensor(
+      cache_key_step_dim,
+      batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(),
+      true);
+    b_cache_value_step = cache_value.getSharedDataTensor(
+      cache_value_step_dim,
+      batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
+      true);
+  }
 
-  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::RopeQuery);
+    apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
+  }
 
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from,
-                             false);
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::RopeKey);
+    apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from,
+                               false);
+  }
 
-  if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim, _from,
-                               true);
-  } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::ValueCacheWrite);
+    if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
+                                 _from, true);
+    } else if (query_step.getDataType() ==
+               ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
+      b_cache_value_step.copyData(value_step);
 #else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+      NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
+    }
   }
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
@@ -612,23 +744,35 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
 
+  auto qk_out_alloc_start = MHAProfileClock::now();
   nntrainer::Tensor out_(
     1, 1,
     is_causal
       ? (((to - from) == 1) ? to : calc_attn_index(to) - calc_attn_index(from))
       : ((to - from) * to),
     num_heads_Q, query_step.getTensorType());
+  addProfileDuration(ProfileStage::QKOutAlloc,
+                     elapsedProfileUs(qk_out_alloc_start));
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
-  compute_kcaches(query_step, b_cached_key, out_, _from, to - from, num_heads_Q,
-                  gqa_size, head_dim, pool);
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::QKCompute);
+    compute_kcaches(query_step, b_cached_key, out_, _from, to - from,
+                    num_heads_Q, gqa_size, head_dim, pool);
+  }
 
-  softmax_triangle(out_, to - from, num_heads_Q, from, pool, sink_step);
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::Softmax);
+    softmax_triangle(out_, to - from, num_heads_Q, from, pool, sink_step);
+  }
 
-  compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
-                                from, num_heads_KV, gqa_size, head_dim, to,
-                                pool);
+  {
+    MHA_PROFILE_SCOPE(ProfileStage::AVCompute);
+    compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
+                                  from, num_heads_KV, gqa_size, head_dim, to,
+                                  pool);
+  }
 }
 
 /************************************************************** */

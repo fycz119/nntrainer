@@ -19,6 +19,8 @@
 #include <map>
 #include <memory>
 #include <stack>
+#include <string>
+#include <cstdint>
 #include <vector>
 
 #include <graph_core.h>
@@ -27,6 +29,18 @@
 
 namespace nntrainer {
 using ExecutionMode = ml::train::ExecutionMode;
+
+struct LayerProfileStat {
+  std::string name;
+  std::string type;
+  uint64_t total_us;
+  uint64_t count;
+  double avg_us;
+};
+
+void resetLayerProfileStats();
+std::vector<LayerProfileStat> getLayerProfileStatsByType();
+std::vector<LayerProfileStat> getLayerProfileStatsByName(size_t limit = 0);
 
 class Connection;
 /**

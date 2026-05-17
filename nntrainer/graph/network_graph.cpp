@@ -42,10 +42,14 @@
 #include <util_func.h>
 #include <weight_layer.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include "graph_node.h"
 #include "tensor.h"
@@ -53,6 +57,85 @@
 #define LNODE(x) std::static_pointer_cast<LayerNode>(x)
 
 namespace nntrainer {
+
+namespace {
+
+using LayerProfileClock = std::chrono::steady_clock;
+constexpr bool LAYER_PROFILE_ENABLED = true;
+
+struct LayerProfileAccumulator {
+  std::string name;
+  std::string type;
+  uint64_t total_us = 0;
+  uint64_t count = 0;
+};
+
+std::mutex layer_profile_mtx;
+std::unordered_map<std::string, LayerProfileAccumulator> layer_profile_by_type;
+std::unordered_map<std::string, LayerProfileAccumulator> layer_profile_by_name;
+
+LayerProfileStat makeLayerProfileStat(const LayerProfileAccumulator &acc) {
+  double avg_us = acc.count == 0 ? 0.0
+                                 : static_cast<double>(acc.total_us) / acc.count;
+  return {acc.name, acc.type, acc.total_us, acc.count, avg_us};
+}
+
+void recordLayerProfile(const std::string &name, const std::string &type,
+                        uint64_t elapsed_us) {
+  std::lock_guard<std::mutex> lock(layer_profile_mtx);
+
+  auto &type_acc = layer_profile_by_type[type];
+  type_acc.name = type;
+  type_acc.type = type;
+  type_acc.total_us += elapsed_us;
+  type_acc.count += 1;
+
+  auto &name_acc = layer_profile_by_name[name];
+  name_acc.name = name;
+  name_acc.type = type;
+  name_acc.total_us += elapsed_us;
+  name_acc.count += 1;
+}
+
+std::vector<LayerProfileStat> sortedLayerProfileStats(
+  const std::unordered_map<std::string, LayerProfileAccumulator> &profile,
+  size_t limit = 0) {
+  std::vector<LayerProfileStat> stats;
+  stats.reserve(profile.size());
+  for (const auto &item : profile) {
+    stats.push_back(makeLayerProfileStat(item.second));
+  }
+
+  std::sort(stats.begin(), stats.end(),
+            [](const LayerProfileStat &lhs, const LayerProfileStat &rhs) {
+              return lhs.total_us > rhs.total_us;
+            });
+
+  if (limit > 0 && stats.size() > limit) {
+    stats.resize(limit);
+  }
+
+  return stats;
+}
+
+} // namespace
+
+void resetLayerProfileStats() {
+  std::lock_guard<std::mutex> lock(layer_profile_mtx);
+  layer_profile_by_type.clear();
+  layer_profile_by_name.clear();
+}
+
+std::vector<LayerProfileStat> getLayerProfileStatsByType() {
+  std::lock_guard<std::mutex> lock(layer_profile_mtx);
+  return sortedLayerProfileStats(layer_profile_by_type);
+}
+
+std::vector<LayerProfileStat> getLayerProfileStatsByName(size_t limit) {
+  std::lock_guard<std::mutex> lock(layer_profile_mtx);
+  return sortedLayerProfileStats(layer_profile_by_name, limit);
+}
+
 int NetworkGraph::compile(const std::string &loss_type) {
   int status = ML_ERROR_NONE;
 
@@ -397,9 +480,20 @@ sharedConstTensors NetworkGraph::forwarding(
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
+    LayerProfileClock::time_point layer_profile_start;
+    if constexpr (LAYER_PROFILE_ENABLED)
+      layer_profile_start = LayerProfileClock::now();
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
     forwarding_op(*iter, training);
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
+    if constexpr (LAYER_PROFILE_ENABLED) {
+      auto layer_profile_end = LayerProfileClock::now();
+      auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          layer_profile_end - layer_profile_start)
+                          .count();
+      recordLayerProfile(ln->getName(), ln->getType(),
+                         static_cast<uint64_t>(elapsed_us));
+    }
   }
 
   sharedConstTensors out;
@@ -422,9 +516,20 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
+    LayerProfileClock::time_point layer_profile_start;
+    if constexpr (LAYER_PROFILE_ENABLED)
+      layer_profile_start = LayerProfileClock::now();
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
     forwarding_op(*iter, training);
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
+    if constexpr (LAYER_PROFILE_ENABLED) {
+      auto layer_profile_end = LayerProfileClock::now();
+      auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          layer_profile_end - layer_profile_start)
+                          .count();
+      recordLayerProfile(ln->getName(), ln->getType(),
+                         static_cast<uint64_t>(elapsed_us));
+    }
   }
 
   sharedConstTensors out;

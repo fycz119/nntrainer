@@ -24,6 +24,12 @@
 #include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <layer_impl.h>
+#include <cstdint>
+#include <list>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace causallm {
 
@@ -47,13 +53,13 @@ public:
    * @brief  Move constructor.
    *  @param[in] SlimMoELayer &&
    */
-  SlimMoELayer(SlimMoELayer &&rhs) noexcept = default;
+  SlimMoELayer(SlimMoELayer &&rhs) = delete;
 
   /**
    * @brief  Move assignment operator.
    * @param[in] rhs SlimMoELayer to be moved.
    */
-  SlimMoELayer &operator=(SlimMoELayer &&rhs) = default;
+  SlimMoELayer &operator=(SlimMoELayer &&rhs) = delete;
 
   /**
    * @copydoc Layer::finalize(InitLayerContext &context)
@@ -106,6 +112,43 @@ public:
 
   static constexpr const char *type = "moe_slim"; /**< type of the layer */
 
+  enum class ProfileStage {
+    IncrementalTotal = 0,
+    SingleTokenFastPath,
+    InputSlice,
+    RouterDot,
+    RouterSoftmax,
+    RouterTopK,
+    TopKNorm,
+    AssignmentBuild,
+    ExpertOutputAlloc,
+    ActiveExpertBuild,
+    WeightCacheHit,
+    WeightCacheMiss,
+    WeightCacheEvict,
+    WeightActivate,
+    ExpertComputeTotal,
+    ExpertGateDot,
+    ExpertActivation,
+    ExpertUpDot,
+    ExpertMul,
+    ExpertDownDot,
+    ExpertScaleAdd,
+    WeightDeactivate,
+    OutputCombine,
+    Count
+  };
+
+  struct ProfileStat {
+    std::string name;
+    uint64_t total_us;
+    uint64_t count;
+    double avg_us;
+  };
+
+  static void resetProfileStats();
+  static std::vector<ProfileStat> getProfileStats();
+
 private:
   unsigned int num_experts;      /**< number of experts */
   unsigned int topk;             /**< number of experts per token, i.e., topk */
@@ -118,6 +161,10 @@ private:
   std::vector<unsigned int> expert_gate_proj_indices;
   std::vector<unsigned int> expert_up_proj_indices;
   std::vector<unsigned int> expert_down_proj_indices;
+  std::list<int> loaded_expert_deque;
+  std::unordered_map<int, std::list<int>::iterator> iteration_map;
+  std::vector<bool> need_load;
+  std::mutex cache_mutex;
   unsigned int gate_idx;
 
   // Intermediate tensor indices
@@ -156,6 +203,16 @@ private:
     const std::vector<std::pair<unsigned, float>> &token_assignments,
     const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
     const nntrainer::Tensor &down_proj, unsigned int hidden_size);
+
+  void incremental_forwarding_single_token(nntrainer::RunLayerContext &context,
+                                           unsigned int from, unsigned int to,
+                                           bool training);
+
+  inline void compute_single_token_expert(
+    const nntrainer::Tensor &token_input, nntrainer::Tensor &output,
+    const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
+    const nntrainer::Tensor &down_proj, float weight,
+    unsigned int hidden_size);
 };
 } // namespace causallm
 

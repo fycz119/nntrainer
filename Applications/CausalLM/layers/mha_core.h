@@ -32,6 +32,8 @@
 #endif
 
 #include <complex>
+#include <cstddef>
+#include <cstdint>
 
 #include <acti_func.h>
 #include <bs_thread_pool_manager.hpp>
@@ -295,6 +297,30 @@ public:
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
+
+  enum class ProfileStage : size_t {
+    IncrementalForwarding = 0,
+    BatchForwarding,
+    TensorSlice,
+    RopeQuery,
+    RopeKey,
+    ValueCacheWrite,
+    QKOutAlloc,
+    QKCompute,
+    Softmax,
+    AVCompute,
+    Count,
+  };
+
+  struct ProfileStat {
+    const char *name;
+    uint64_t total_us;
+    uint64_t count;
+    double avg_us;
+  };
+
+  static void resetProfileStats();
+  static std::vector<ProfileStat> getProfileStats();
 
   inline static const std::string type = "mha_core";
 

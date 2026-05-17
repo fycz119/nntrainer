@@ -25,6 +25,7 @@
 #include <cmath>
 #include <engine.h>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <vector>
@@ -33,6 +34,8 @@
 #include <layer_context.h>
 #include <lm_head.h>
 #include <mha_core.h>
+#include <network_graph.h>
+#include <qwen_moe_layer_fsu.h>
 #include <tensor.h>
 
 #include <causal_lm.h>
@@ -287,6 +290,10 @@ void CausalLM::registerCustomLayers() {
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
+
+  MHACoreLayer::resetProfileStats();
+  SlimMoELayer::resetProfileStats();
+  nntrainer::resetLayerProfileStats();
 
   auto start_total = std::chrono::high_resolution_clock::now();
   if (!is_initialized) {
@@ -550,6 +557,46 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     std::cout << "\n\n";
     std::cout << "=================[ LLM with NNTrainer ]===================\n";
+    std::cout << "MHA core profile:\n";
+    auto old_precision = std::cout.precision();
+    std::cout << std::fixed << std::setprecision(3);
+    for (const auto &stat : MHACoreLayer::getProfileStats()) {
+      if (stat.count == 0)
+        continue;
+      std::cout << "  " << stat.name << ": total "
+                << (static_cast<double>(stat.total_us) / 1000.0) << " ms, "
+                << "count " << stat.count << ", avg "
+                << (stat.avg_us / 1000.0) << " ms\n";
+    }
+    std::cout << "MoE slim profile:\n";
+    for (const auto &stat : SlimMoELayer::getProfileStats()) {
+      if (stat.count == 0)
+        continue;
+      std::cout << "  " << stat.name << ": total "
+                << (static_cast<double>(stat.total_us) / 1000.0) << " ms, "
+                << "count " << stat.count << ", avg "
+                << (stat.avg_us / 1000.0) << " ms\n";
+    }
+    std::cout << "Layer type profile:\n";
+    for (const auto &stat : nntrainer::getLayerProfileStatsByType()) {
+      if (stat.count == 0)
+        continue;
+      std::cout << "  " << stat.type << ": total "
+                << (static_cast<double>(stat.total_us) / 1000.0) << " ms, "
+                << "count " << stat.count << ", avg "
+                << (stat.avg_us / 1000.0) << " ms\n";
+    }
+    std::cout << "Layer name profile top 20:\n";
+    for (const auto &stat : nntrainer::getLayerProfileStatsByName(20)) {
+      if (stat.count == 0)
+        continue;
+      std::cout << "  " << stat.name << " (" << stat.type << "): total "
+                << (static_cast<double>(stat.total_us) / 1000.0) << " ms, "
+                << "count " << stat.count << ", avg "
+                << (stat.avg_us / 1000.0) << " ms\n";
+    }
+    std::cout.unsetf(std::ios::floatfield);
+    std::cout << std::setprecision(old_precision);
     std::cout << "prefill: " << init_len << " tokens, "
               << prefill_duration.count() << " ms, "
               << ((double)init_len / prefill_duration.count() * 1000)
